@@ -24,8 +24,9 @@ parser.add_argument('-r', '--rpc_address',
          'https://api.mainnet-beta.solana.com')
 
 parser.add_argument('--max_snapshot_age', default=1300, type=int, help='How many slots ago the snapshot was created (in slots)')
+parser.add_argument('--target_download_speed', default=90, type=int, help='Target average snapshot download speed in megabytes')
 parser.add_argument('--min_download_speed', default=60, type=int, help='Minimum average snapshot download speed in megabytes')
-parser.add_argument('--max_download_speed', type=int, 
+parser.add_argument('--max_download_speed', type=int,
 help='Maximum snapshot download speed in megabytes - https://github.com/c29r3/solana-snapshot-finder/issues/11. Example: --max_download_speed 192')
 parser.add_argument('--max_latency', default=40, type=int, help='The maximum value of latency (milliseconds). If latency > max_latency --> skip')
 parser.add_argument('--with_private_rpc', action="store_true", help='Enable adding and checking RPCs with the --private-rpc option.This slow down checking and searching but potentially increases'
@@ -47,6 +48,7 @@ RPC = args.rpc_address
 WITH_PRIVATE_RPC = args.with_private_rpc
 MAX_SNAPSHOT_AGE_IN_SLOTS = args.max_snapshot_age
 THREADS_COUNT = args.threads_count
+TARGET_DOWNLOAD_SPEED_MB = args.target_download_speed
 MIN_DOWNLOAD_SPEED_MB = args.min_download_speed
 MAX_DOWNLOAD_SPEED_MB = args.max_download_speed
 SPEED_MEASURE_TIME_SEC = args.measurement_time
@@ -224,7 +226,7 @@ def get_snapshot_slot(rpc_address: str):
         if 'location' in str(r.headers) and 'error' not in str(r.text) and r.elapsed.total_seconds() * 1000 > MAX_LATENCY:
             DISCARDED_BY_LATENCY += 1
             return None
-    
+
 
         if 'location' in str(r.headers) and 'error' not in str(r.text):
             snap_location_ = r.headers["location"]
@@ -316,17 +318,17 @@ def download(url: str):
     try:
         # dirty trick with wget. Details here - https://github.com/c29r3/solana-snapshot-finder/issues/11
         if MAX_DOWNLOAD_SPEED_MB is not None:
-            process = subprocess.run(['/usr/bin/wget', f'--limit-rate={MAX_DOWNLOAD_SPEED_MB}M', '--trust-server-names', url, f'-O{temp_fname}'], 
+            process = subprocess.run(['/usr/bin/wget', f'--limit-rate={MAX_DOWNLOAD_SPEED_MB}M', '--trust-server-names', url, f'-O{temp_fname}'],
               stdout=subprocess.PIPE,
               universal_newlines=True)
         else:
-            process = subprocess.run(['/usr/bin/wget', '--trust-server-names', url, f'-O{temp_fname}'], 
+            process = subprocess.run(['/usr/bin/wget', '--trust-server-names', url, f'-O{temp_fname}'],
               stdout=subprocess.PIPE,
               universal_newlines=True)
 
         logger.info(f'Rename the downloaded file {temp_fname} --> {fname}')
         os.rename(temp_fname, f'{SNAPSHOT_PATH}/{fname}')
-    
+
     except Exception as unknwErr:
         logger.error(f'Exception in download() func. Make sure wget is installed\n{unknwErr}')
 
@@ -357,7 +359,7 @@ def main_worker():
         logger.info(f'The following information shows for what reason and how many RPCs were skipped.'
         f'Timeout most probably mean, that node RPC port does not respond (port is closed)\n'
         f'{DISCARDED_BY_ARCHIVE_TYPE=} | {DISCARDED_BY_LATENCY=} |'
-        f' {DISCARDED_BY_SLOT=} | {DISCARDED_BY_TIMEOUT=} | {DISCARDED_BY_UNKNW_ERR=}') 
+        f' {DISCARDED_BY_SLOT=} | {DISCARDED_BY_TIMEOUT=} | {DISCARDED_BY_UNKNW_ERR=}')
 
         if len(json_data["rpc_nodes"]) == 0:
             logger.info(f'No snapshot nodes were found matching the given parameters: {args.max_snapshot_age=}')
@@ -379,6 +381,7 @@ def main_worker():
         logger.info(f'All data is saved to json file - {SNAPSHOT_PATH}/snapshot.json')
 
         best_snapshot_node = {}
+        acceptable_snapshot_nodes = []
         num_of_rpc_to_check = 15
 
         rpc_nodes_inc_sorted = []
@@ -403,27 +406,14 @@ def main_worker():
                 continue
 
             elif down_speed_bytes >= MIN_DOWNLOAD_SPEED_MB * 1e6:
-                logger.info(f'Suitable snapshot server found: {rpc_node=} {down_speed_mb=}')
-                for path in reversed(rpc_node["files_to_download"]):
-                    # do not download full snapshot if it already exists locally
-                    if str(path).startswith("/snapshot-"):
-                        full_snap_slot__ = path.split("-")[1]
-                        if full_snap_slot__ == FULL_LOCAL_SNAP_SLOT:
-                            continue
-
-                    
-                    if 'incremental' in path:
-                        r = do_request(f'http://{rpc_node["snapshot_address"]}/incremental-snapshot.tar.bz2', method_='head', timeout_=2)
-                        if 'location' in str(r.headers) and 'error' not in str(r.text):
-                            best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{r.headers["location"]}'
-                        else:
-                            best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
-
-                    else:
-                        best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
-                    logger.info(f'Downloading {best_snapshot_node} snapshot to {SNAPSHOT_PATH}')
-                    download(url=best_snapshot_node)
-                return 0
+                rpc_node["down_speed_bytes"] = down_speed_bytes
+                rpc_node["down_speed_mb"] = down_speed_mb
+                acceptable_snapshot_nodes.append(rpc_node)
+                logger.info(f'Acceptable snapshot server found: {rpc_node=} {down_speed_mb=}')
+                # If a node matches the target speed, use it
+                if down_speed_bytes >= TARGET_DOWNLOAD_SPEED_MB * 1e6:
+                    logger.info(f'Target download speed reached {down_speed_mb} >= {TARGET_DOWNLOAD_SPEED_MB}')
+                    break
 
             elif i > num_of_rpc_to_check:
                 logger.info(f'The limit on the number of RPC nodes from'
@@ -433,7 +423,30 @@ def main_worker():
             else:
                 logger.info(f'{down_speed_mb=} < {MIN_DOWNLOAD_SPEED_MB=}')
 
-        if best_snapshot_node is {}:
+        if len(acceptable_snapshot_nodes) > 0:
+            acceptable_snapshot_nodes.sort(key=lambda r: r["down_speed_bytes"], reverse=True)
+            rpc_node = acceptable_snapshot_nodes[0]
+
+            logger.info(f'Downloading snapshot from server: {rpc_node=}')
+            for path in reversed(rpc_node["files_to_download"]):
+                # do not download full snapshot if it already exists locally
+                if str(path).startswith("/snapshot-"):
+                    full_snap_slot__ = path.split("-")[1]
+                    if full_snap_slot__ == FULL_LOCAL_SNAP_SLOT:
+                        continue
+
+                if 'incremental' in path:
+                    r = do_request(f'http://{rpc_node["snapshot_address"]}/incremental-snapshot.tar.bz2', method_='head', timeout_=2)
+                    if 'location' in str(r.headers) and 'error' not in str(r.text):
+                        best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{r.headers["location"]}'
+                    else:
+                        best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
+                else:
+                    best_snapshot_node = f'http://{rpc_node["snapshot_address"]}{path}'
+                logger.info(f'Downloading {best_snapshot_node} snapshot to {SNAPSHOT_PATH}')
+                download(url=best_snapshot_node)
+            return 0
+        else:
             logger.error(f'No snapshot nodes were found matching the given parameters:{args.min_download_speed=}'
                   f'\nTry restarting the script with --with_private_rpc'
                   f'RETRY #{NUM_OF_ATTEMPTS}\\{NUM_OF_MAX_ATTEMPTS}')
@@ -497,6 +510,6 @@ while NUM_OF_ATTEMPTS <= NUM_OF_MAX_ATTEMPTS:
     if NUM_OF_ATTEMPTS >= NUM_OF_MAX_ATTEMPTS:
         logger.error(f'Could not find a suitable snapshot --> exit')
         sys.exit()
-    
+
     logger.info(f"Sleeping {SLEEP_BEFORE_RETRY} seconds before next try")
     time.sleep(SLEEP_BEFORE_RETRY)
